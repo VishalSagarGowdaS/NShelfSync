@@ -3,29 +3,39 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
+
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 
 import { env } from './config/env.js';
 import apiRouter from './routes/api.js';
 import { testDbConnection } from './database/db.js';
+
 import {
   createProductIndex,
   syncAllProductsFromDbToOpenSearch,
 } from './opensearch/indexManager.js';
+
 import { startOutboxWorker } from './workers/outboxWorker.js';
 import { startKafkaConsumers } from './workers/kafkaConsumers.js';
 
 export const app = express();
 
+// --------------------------------------------------
 // Security Headers
+// --------------------------------------------------
+
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
 
-// Cross-Origin Resource Sharing
+// --------------------------------------------------
+// CORS Configuration
+// --------------------------------------------------
+
 app.use(
   cors({
     origin: [
@@ -37,7 +47,11 @@ app.use(
   })
 );
 
-// Parse JSON and preserve raw body for Razorpay webhook verification
+// --------------------------------------------------
+// JSON Body Parser
+// Preserve raw body for Razorpay webhook verification
+// --------------------------------------------------
+
 app.use(
   express.json({
     verify: (req: any, _res, buf) => {
@@ -49,7 +63,10 @@ app.use(
 
 app.use(express.urlencoded({ extended: true }));
 
-// Global Rate Limiter
+// --------------------------------------------------
+// API Rate Limiter
+// --------------------------------------------------
+
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
@@ -63,12 +80,62 @@ const apiLimiter = rateLimit({
 
 app.use('/api', apiLimiter);
 
-// Mount ShelfSync API Routes
+// --------------------------------------------------
+// ShelfSync API Routes
+// --------------------------------------------------
+
 app.use('/api', apiRouter);
 
+// --------------------------------------------------
+// React Frontend Configuration
+// --------------------------------------------------
+
+const currentDir = dirname(fileURLToPath(import.meta.url));
+
+const frontendDistPath = resolve(
+  currentDir,
+  '../../frontend/dist'
+);
+
+if (existsSync(frontendDistPath)) {
+  console.log('[Frontend] Build directory found.');
+
+  // Serve frontend static files
+  app.use(express.static(frontendDistPath));
+
+  // React SPA fallback
+  app.get('*', (req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api')) {
+      return next();
+    }
+
+    res.sendFile(
+      resolve(frontendDistPath, 'index.html'),
+      (err) => {
+        if (err) {
+          next(err);
+        }
+      }
+    );
+  });
+} else {
+  console.warn(
+    '[Frontend] Build directory not found:',
+    frontendDistPath
+  );
+}
+
+// --------------------------------------------------
 // Global Error Handler
+// --------------------------------------------------
+
 app.use(
-  (err: any, _req: Request, res: Response, _next: NextFunction) => {
+  (
+    err: any,
+    _req: Request,
+    res: Response,
+    _next: NextFunction
+  ) => {
     console.error('[Unhandled Server Error]:', err);
 
     res.status(err.status || 500).json({
@@ -78,37 +145,49 @@ app.use(
   }
 );
 
+// --------------------------------------------------
 // Server Initialization
+// --------------------------------------------------
+
 export async function startServer() {
   const port = env.PORT;
 
   const server = app.listen(port, async () => {
     console.log('=======================================================');
-    console.log('  ShelfSync E-Commerce API Server Running!');
-    console.log(`  Port: ${port} | Environment: ${env.NODE_ENV}`);
-    console.log(`  Health Check: /api/health`);
+    console.log('       ShelfSync E-Commerce Server Running!');
+    console.log(`       Port: ${port}`);
+    console.log(`       Environment: ${env.NODE_ENV}`);
+    console.log('       Frontend: /');
+    console.log('       API Health: /api/health');
     console.log('=======================================================');
 
     try {
-      // Verify Aiven PostgreSQL
+      // PostgreSQL
       const dbConn = await testDbConnection();
 
       if (dbConn.connected) {
-        console.log('[Aiven PostgreSQL] Database connected and ready.');
+        console.log('[PostgreSQL] Connected successfully.');
       } else {
-        console.warn('[Aiven PostgreSQL] Database connection unavailable.');
+        console.warn('[PostgreSQL] Connection unavailable.');
       }
 
-      // Initialize OpenSearch index
+      // OpenSearch
       await createProductIndex();
       await syncAllProductsFromDbToOpenSearch();
 
-      // Start background event workers
+      console.log('[OpenSearch] Initialization completed.');
+
+      // Background workers
       startOutboxWorker(5000);
 
-      startKafkaConsumers().catch((kErr) => {
-        console.warn('[Aiven Kafka] Consumer startup note:', kErr.message);
+      // Kafka
+      startKafkaConsumers().catch((error) => {
+        console.warn(
+          '[Kafka] Consumer startup error:',
+          error.message
+        );
       });
+
     } catch (error) {
       console.error('[Startup Initialization Error]:', error);
     }
@@ -122,13 +201,17 @@ export async function startServer() {
   return server;
 }
 
-// Start if executed directly (Windows + Linux compatible)
+// --------------------------------------------------
+// Start Server (Windows + Linux Compatible)
+// --------------------------------------------------
+
 if (
   process.argv[1] &&
-  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+  import.meta.url ===
+    pathToFileURL(resolve(process.argv[1])).href
 ) {
-  startServer().catch((err) => {
-    console.error('[Fatal Startup Error]:', err);
+  startServer().catch((error) => {
+    console.error('[Fatal Startup Error]:', error);
     process.exit(1);
   });
 }
